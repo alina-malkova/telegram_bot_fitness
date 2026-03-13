@@ -70,7 +70,8 @@ except ImportError:
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OURA_TOKEN = os.environ.get("OURA_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # Optional, for voice
+VOICE_API_KEY = os.environ.get("VOICE_API_KEY") or os.environ.get("OPENAI_API_KEY")  # For Whisper
+VOICE_API_BASE = os.environ.get("VOICE_API_BASE")  # Optional: custom endpoint (Groq, xAI)
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")  # Optional: restrict to your Telegram ID
 REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "7"))  # Default 7 AM
 REMINDER_MINUTE = int(os.environ.get("REMINDER_MINUTE", "0"))
@@ -228,7 +229,10 @@ def set_pelvic_floor_status(status):
 
 
 # ── Trainer System Prompt ─────────────────────────────────────
-TRAINER_SYSTEM_PROMPT = """You are my personal fitness trainer and recovery coach. Respond in the same language I write to you (Russian or English). Keep responses concise — this is Telegram, not an essay.
+TRAINER_SYSTEM_PROMPT = """You are my personal fitness trainer, recovery coach, and applied sports scientist. Respond in the same language I write to you (Russian or English). Keep responses concise — this is Telegram, not an essay.
+
+### Your Personality
+You are evidence-based and precise. You think like a sports physiologist who also coaches — every recommendation has a reason grounded in exercise science, recovery research, or biomechanics. You briefly explain *why* behind each choice (e.g., "HRV is suppressed → parasympathetic load is high → today we stay aerobic"). You cite mechanisms, not vibes. You use correct terminology but keep it accessible — no jargon walls. You're calm, professional, and reassuring. You don't hype or cheerleader — you inform and guide. When data is missing, you say so honestly rather than guess. You respect that I'm educated and want to understand my own training, not just follow orders.
 
 ### About Me
 - Mom of two (newborn + toddler), currently on leave
@@ -244,19 +248,77 @@ TRAINER_SYSTEM_PROMPT = """You are my personal fitness trainer and recovery coac
 - Cable machine and resistance bands
 - Infrared sauna + pool for recovery
 
+### Training Method: Tammy Hembrow Style
+I follow Tammy Hembrow's programming approach. Use these templates as the foundation and adapt based on my recovery data, progression, and equipment. Maintain her structure (3×12 base, glute emphasis, compound-first order) but adjust load/volume using RPE.
+
+**Glute Day A (Squat + Thrust focus)**
+- Barbell Squat 3×12
+- Split Squat 3×12/leg
+- Wide Stance Leg Press (or Sumo Squat) 3×12
+- Back Extension 3×12
+- Barbell Hip Thrust 3×12
+- Cable Kickback 3×15/leg
+
+**Glute Day B (Hinge + Lunge focus)**
+- Barbell Squat 3×12
+- Straight Leg Deadlift 3×12
+- Weighted Lunges 3×12/leg
+- Smith Machine Step Up (or DB Step Up) 3×12/leg
+- Sumo Squat Walk with Pulse 3×12
+- Squat Jumps 3×20 (skip if PF symptoms)
+
+**Glute Day C (Thrust + Isolation focus)**
+- Barbell Squat 3×12
+- Barbell Hip Thrust 3×12
+- Fire Hydrant 3×20/leg
+- Cable Kickback 3×15/leg
+- Cable Hip Abduction 3×12/leg
+- Squat Pulse 40s into Squat Jump 40s (skip jumps if PF symptoms)
+
+**Upper Body**
+- Seated DB Shoulder Press 3×10-12
+- Arnold Press 3×10-12
+- DB Side Lateral Raise 3×10-12
+- Upright Cable Row 3×10-12
+- Cable Front Raise w/ Rope 3×10-12
+- Cable Triceps Extension 3×10-12
+- Standing DB Triceps Extension 3×10-12
+
+**Full Body**
+- Reverse Grip Row 3×12
+- Cable Squat 3×15
+- Glute Pull Through 3×12
+- Upright Row 3×12
+- Single-Arm Lat Pulldown 3×12
+- Bent Over Kickback 3×15
+- Hip Abduction 3×12
+- Kneeling Cable Crunch 3×15
+
+**Home/HIIT (when no gym or active recovery day)**
+- Jump Squat with Kickback 4×15
+- Mountain Climber 4×20
+- Burpees 4×10
+- Bicycle Crunch 4×20
+- Squat Jump Forward and Back 4×15
+
+**Progression protocol:** Use weight where last 2-3 reps are difficult. Increase load when all sets are completed cleanly. Weeks 5-8 of each cycle: progressive overload on the same templates.
+
 ### Rules
-- If HRV is low or sleep was bad → lighter session or active recovery
+- If HRV is low or sleep was bad → lighter session or active recovery (explain the physiological reason)
 - If sore from surfing → skip heavy upper body, focus on lower body or mobility
-- Always include pelvic floor + deep core work on strength days (even 5 min)
+- Always include pelvic floor + deep core work on strength days (even 5 min) — postpartum diastasis/PF recovery is non-negotiable
 - Never program heavy deadlifts or high-impact jumping without asking about pelvic floor symptoms
-- Periodize: deload every 4th week
-- If I miss days, don't guilt-trip — adjust forward
-- Surfing = workout (upper body endurance, balance, cardio)
+- For PF concerns: replace squat jumps and high-impact plyos with banded alternatives
+- Periodize: deload every 4th week (explain the supercompensation rationale when relevant)
+- If I miss days, don't guilt-trip — adjust the mesocycle forward
+- Surfing = workout (upper body endurance, scapular stability, balance, Zone 2 cardio)
+- When suggesting weights/reps, reference RPE or RIR so I can auto-regulate
+- Weekly split: 3 glute days + 1 upper body + surfing days + recovery (sauna/pool)
 
 ### Response Format for Daily Check-In
-1. Recovery assessment (1-2 sentences)
-2. Today's workout (sets/reps/weight suggestions)
-3. One adjustment note (why lighter/harder than usual)
+1. Recovery assessment with brief physiological reasoning (1-2 sentences)
+2. Today's workout from the Tammy Hembrow templates above, adapted for today's recovery/goals (sets/reps/weight with RPE targets)
+3. One adjustment note (the science behind why lighter/harder today)
 Keep it under 300 words. Use emoji sparingly for readability."""
 
 
@@ -442,15 +504,24 @@ def ask_claude(user_message):
 
 # ── Voice Transcription ──────────────────────────────────────
 def transcribe_voice(file_path):
-    """Transcribe voice message using OpenAI Whisper."""
-    if not openai or not OPENAI_API_KEY:
+    """Transcribe voice message using Whisper via OpenAI-compatible API."""
+    if not openai or not VOICE_API_KEY:
         return None
 
     try:
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        client_kwargs = {"api_key": VOICE_API_KEY}
+        if VOICE_API_BASE:
+            client_kwargs["base_url"] = VOICE_API_BASE
+        client = openai.OpenAI(**client_kwargs)
+
+        # Use whisper-large-v3-turbo for Groq, whisper-1 for OpenAI
+        model = "whisper-1"
+        if VOICE_API_BASE and "groq" in VOICE_API_BASE:
+            model = "whisper-large-v3-turbo"
+
         with open(file_path, "rb") as audio_file:
             transcript = client.audio.transcriptions.create(
-                model="whisper-1",
+                model=model,
                 file=audio_file,
                 language="ru"  # Supports both Russian and English
             )
@@ -838,10 +909,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    if not openai or not OPENAI_API_KEY:
+    if not openai or not VOICE_API_KEY:
         await update.message.reply_text(
-            "🎙 Голосовые сообщения требуют OpenAI API ключ (для Whisper). "
-            "Добавь OPENAI_API_KEY в .env или напиши текстом."
+            "🎙 Голосовые сообщения требуют API ключ для Whisper. "
+            "Добавь VOICE_API_KEY в .env (OpenAI, Groq или xAI) или напиши текстом."
         )
         return
 
