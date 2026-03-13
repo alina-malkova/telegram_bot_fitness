@@ -32,6 +32,9 @@ import sys
 import json
 import sqlite3
 import logging
+import logging.handlers
+import asyncio
+import tempfile
 from datetime import datetime, timedelta, time as dt_time
 from pathlib import Path
 
@@ -61,6 +64,11 @@ except ImportError:
     openai = None  # Voice transcription will be disabled
 
 try:
+    import edge_tts
+except ImportError:
+    edge_tts = None  # Voice replies will be disabled
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -70,8 +78,10 @@ except ImportError:
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OURA_TOKEN = os.environ.get("OURA_TOKEN")
-VOICE_API_KEY = os.environ.get("VOICE_API_KEY") or os.environ.get("OPENAI_API_KEY")  # For Whisper
+VOICE_API_KEY = os.environ.get("VOICE_API_KEY") or os.environ.get("OPENAI_API_KEY")  # For Whisper STT
 VOICE_API_BASE = os.environ.get("VOICE_API_BASE")  # Optional: custom endpoint (Groq, xAI)
+TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-JennyNeural")  # Edge TTS voice
+VOICE_MODE = os.environ.get("VOICE_MODE", "both")  # "both", "text", "voice" — reply mode
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID")  # Optional: restrict to your Telegram ID
 REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "7"))  # Default 7 AM
 REMINDER_MINUTE = int(os.environ.get("REMINDER_MINUTE", "0"))
@@ -81,7 +91,24 @@ for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (ANTHROPIC_API_KEY, "ANTHR
     if not var:
         sys.exit(f"Error: Set {name} in environment or .env file")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+LOG_DIR = Path(os.environ.get(
+    "LOG_DIR",
+    os.path.expanduser("~/Library/CloudStorage/OneDrive-FloridaInstituteofTechnology/telegram-bot-fitness/logs")
+))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / f"bot_{datetime.now().strftime('%Y-%m-%d')}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.TimedRotatingFileHandler(
+            LOG_FILE, when="midnight", backupCount=30, encoding="utf-8"
+        ),
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # ── Database (SQLite) ─────────────────────────────────────────
@@ -229,7 +256,7 @@ def set_pelvic_floor_status(status):
 
 
 # ── Trainer System Prompt ─────────────────────────────────────
-TRAINER_SYSTEM_PROMPT = """You are my personal fitness trainer, recovery coach, and applied sports scientist. Respond in the same language I write to you (Russian or English). Keep responses concise — this is Telegram, not an essay.
+TRAINER_SYSTEM_PROMPT = """You are my personal fitness trainer, recovery coach, and applied sports scientist. Always respond in English only. Keep responses concise — this is Telegram, not an essay.
 
 ### Your Personality
 You are evidence-based and precise. You think like a sports physiologist who also coaches — every recommendation has a reason grounded in exercise science, recovery research, or biomechanics. You briefly explain *why* behind each choice (e.g., "HRV is suppressed → parasympathetic load is high → today we stay aerobic"). You cite mechanisms, not vibes. You use correct terminology but keep it accessible — no jargon walls. You're calm, professional, and reassuring. You don't hype or cheerleader — you inform and guide. When data is missing, you say so honestly rather than guess. You respect that I'm educated and want to understand my own training, not just follow orders.
@@ -237,7 +264,7 @@ You are evidence-based and precise. You think like a sports physiologist who als
 ### About Me
 - Mom of two (newborn + toddler), currently on leave
 - Located in Satellite Beach, FL — ocean access year-round
-- Active background: surfing, Pilates, strength training
+- Active background: outdoor activities (running, hiking, swimming, cycling), Pilates, strength training
 - Current priority: postpartum recovery + rebuilding strength
 - I train daily — but intensity flexes based on recovery data
 
@@ -265,7 +292,7 @@ I follow Tammy Hembrow's programming approach. Use these templates as the founda
 - Weighted Lunges 3×12/leg
 - Smith Machine Step Up (or DB Step Up) 3×12/leg
 - Sumo Squat Walk with Pulse 3×12
-- Squat Jumps 3×20 (skip if PF symptoms)
+- Squat Jumps 3×20 (skip if PF symptoms — replace with banded squat pulses)
 
 **Glute Day C (Thrust + Isolation focus)**
 - Barbell Squat 3×12
@@ -273,7 +300,7 @@ I follow Tammy Hembrow's programming approach. Use these templates as the founda
 - Fire Hydrant 3×20/leg
 - Cable Kickback 3×15/leg
 - Cable Hip Abduction 3×12/leg
-- Squat Pulse 40s into Squat Jump 40s (skip jumps if PF symptoms)
+- Squat Pulse 40s into Squat Jump 40s (skip jumps if PF symptoms — replace with glute bridge hold)
 
 **Upper Body**
 - Seated DB Shoulder Press 3×10-12
@@ -303,17 +330,36 @@ I follow Tammy Hembrow's programming approach. Use these templates as the founda
 
 **Progression protocol:** Use weight where last 2-3 reps are difficult. Increase load when all sets are completed cleanly. Weeks 5-8 of each cycle: progressive overload on the same templates.
 
+### Exercise Reference (explain form when asked)
+When I ask about an exercise, provide a brief description of:
+1. Setup and starting position
+2. Key movement cues (2-3 bullet points)
+3. Common mistakes to avoid
+4. Muscles targeted
+5. PF-safe modifications if relevant
+
+Key exercises in this program:
+- **Barbell Hip Thrust**: Back on bench, bar across hips, drive through heels, full hip extension, squeeze glutes at top. Avoid hyperextending lower back.
+- **Cable Kickback**: Face cable machine, ankle strap, hinge slightly forward, extend hip back keeping knee slightly bent. Control the eccentric.
+- **Fire Hydrant**: All fours, lift bent knee out to side to hip height. Keep core braced, avoid shifting weight.
+- **Sumo Squat Walk with Pulse**: Wide stance, toes out, squat to parallel, pulse at bottom, step laterally while maintaining depth.
+- **Split Squat**: Rear foot elevated (Bulgarian) or flat. Front knee tracks over toe, torso upright, lower until rear knee nearly touches ground.
+- **Straight Leg Deadlift (RDL)**: Soft knee lock, hinge at hips, bar close to legs, feel hamstring stretch, squeeze glutes to return. Keep spine neutral.
+- **Cable Hip Abduction**: Stand sideways to cable, strap on far ankle, lift leg away from body. Control both directions.
+- **Arnold Press**: Start with palms facing you, rotate palms out as you press overhead. Full ROM shoulder press with rotation.
+- **Glute Pull Through**: Face away from cable, rope between legs, hinge forward, drive hips through to standing. Similar to kettlebell swing mechanics.
+
 ### Rules
 - If HRV is low or sleep was bad → lighter session or active recovery (explain the physiological reason)
-- If sore from surfing → skip heavy upper body, focus on lower body or mobility
+- If sore from outdoor activity → adjust training to avoid overloading fatigued muscle groups
 - Always include pelvic floor + deep core work on strength days (even 5 min) — postpartum diastasis/PF recovery is non-negotiable
 - Never program heavy deadlifts or high-impact jumping without asking about pelvic floor symptoms
 - For PF concerns: replace squat jumps and high-impact plyos with banded alternatives
 - Periodize: deload every 4th week (explain the supercompensation rationale when relevant)
 - If I miss days, don't guilt-trip — adjust the mesocycle forward
-- Surfing = workout (upper body endurance, scapular stability, balance, Zone 2 cardio)
+- Outdoor activities (running, swimming, hiking, cycling) count as cardio/conditioning — factor them into weekly volume
 - When suggesting weights/reps, reference RPE or RIR so I can auto-regulate
-- Weekly split: 3 glute days + 1 upper body + surfing days + recovery (sauna/pool)
+- Weekly split: 3 glute days + 1 upper body + outdoor activity days + recovery (sauna/pool)
 
 ### Response Format for Daily Check-In
 1. Recovery assessment with brief physiological reasoning (1-2 sentences)
@@ -357,7 +403,7 @@ def get_oura_summary(date_str=None):
     readiness = fetch_oura("usercollection/daily_readiness", date_str, next_day)
     activity = fetch_oura("usercollection/daily_activity", date_str, next_day)
 
-    parts = [f"📊 Oura данные за {date_str}:"]
+    parts = [f"📊 Oura data for {date_str}:"]
 
     if sleep:
         s = sleep[-1]
@@ -379,7 +425,7 @@ def get_oura_summary(date_str=None):
         parts.append(f"🔥 Active cal: {cal} | Steps: {steps}")
 
     if len(parts) == 1:
-        parts.append("Данные ещё не доступны (Oura обычно обновляет к утру)")
+        parts.append("Data not yet available (Oura usually updates by morning)")
 
     return "\n".join(parts)
 
@@ -499,7 +545,7 @@ def ask_claude(user_message):
         return reply
     except Exception as e:
         logger.error(f"Claude API error: {e}")
-        return f"Ошибка Claude API: {e}"
+        return f"Claude API error: {e}"
 
 
 # ── Voice Transcription ──────────────────────────────────────
@@ -523,12 +569,69 @@ def transcribe_voice(file_path):
             transcript = client.audio.transcriptions.create(
                 model=model,
                 file=audio_file,
-                language="ru"  # Supports both Russian and English
+                language="en"
             )
         return transcript.text
     except Exception as e:
         logger.error(f"Whisper error: {e}")
         return None
+
+
+# ── Text-to-Speech ───────────────────────────────────────────
+async def text_to_voice(text):
+    """Convert text to voice using Edge TTS. Returns path to mp3 file or None."""
+    if not edge_tts:
+        return None
+    try:
+        # Strip markdown formatting for cleaner speech
+        clean = text
+        for ch in ["*", "_", "`", "#"]:
+            clean = clean.replace(ch, "")
+
+        fd, out_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+
+        communicate = edge_tts.Communicate(clean, TTS_VOICE)
+        await communicate.save(out_path)
+        return out_path
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return None
+
+
+async def send_voice_reply(update_or_context, chat_id, text, parse_mode="Markdown"):
+    """Send text reply + voice message. Adapts based on VOICE_MODE."""
+    # Determine bot object
+    if hasattr(update_or_context, 'message'):
+        bot = update_or_context.message
+        send_text = bot.reply_text
+        send_voice_fn = bot.reply_voice
+    else:
+        # It's a context (from scheduled job)
+        async def send_text(t, **kw):
+            await update_or_context.bot.send_message(chat_id=chat_id, text=t, **kw)
+        async def send_voice_fn(v, **kw):
+            await update_or_context.bot.send_voice(chat_id=chat_id, voice=v, **kw)
+
+    # Always send text
+    if VOICE_MODE != "voice":
+        await send_text(text, parse_mode=parse_mode)
+
+    # Send voice if enabled
+    if VOICE_MODE in ("both", "voice") and edge_tts:
+        voice_path = await text_to_voice(text)
+        if voice_path:
+            try:
+                with open(voice_path, "rb") as vf:
+                    await send_voice_fn(vf)
+            finally:
+                try:
+                    os.remove(voice_path)
+                except OSError:
+                    pass
+    elif VOICE_MODE == "voice":
+        # Fallback to text if TTS unavailable
+        await send_text(text, parse_mode=parse_mode)
 
 
 # ── Access Control ────────────────────────────────────────────
@@ -549,18 +652,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = (
         "🏋️ *AI Fitness Trainer*\n\n"
-        "Я твой персональный тренер! Вот что я умею:\n\n"
-        "📋 /checkin — утренний чек-ин (Oura + Apple Watch + тренировка)\n"
-        "📅 /week — план на неделю\n"
-        "💪 /log — записать тренировку\n"
-        "📈 /progress — посмотреть прогресс\n"
-        "⌚ /health — принять данные Apple Watch\n"
-        "⏰ /remind — настроить утреннее напоминание\n"
-        "🔄 /deload — проверить/сбросить цикл нагрузки\n"
-        "📊 /updateprogress — записать текущие показатели\n\n"
-        f"💡 Твой Telegram ID: `{user_id}` — "
-        "добавь его в ALLOWED_USER_ID чтобы бот был только твой.\n\n"
-        "Можешь просто писать текст или отправлять голосовые — я пойму!"
+        "I'm your personal trainer! Here's what I can do:\n\n"
+        "📋 /checkin — morning check-in (Oura + Apple Watch + workout)\n"
+        "📅 /week — weekly training plan\n"
+        "💪 /log — log a workout\n"
+        "📈 /progress — view progress\n"
+        "⌚ /health — receive Apple Watch data\n"
+        "⏰ /remind — set morning reminder\n"
+        "🔄 /deload — check/reset training cycle\n"
+        "📊 /updateprogress — record current lifts\n\n"
+        f"💡 Your Telegram ID: `{user_id}` — "
+        "add it to ALLOWED_USER_ID to make the bot private.\n\n"
+        "You can also just text or send voice messages — I'll understand!"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -569,39 +672,39 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    await update.message.reply_text("🔄 Тяну данные из Oura...")
+    await update.message.reply_text("🔄 Pulling Oura data...")
     oura_data = get_oura_summary()
 
     keyboard = [
         [
-            InlineKeyboardButton("⚡ Энергия: низкая", callback_data="energy_low"),
-            InlineKeyboardButton("⚡ Ок", callback_data="energy_ok"),
-            InlineKeyboardButton("⚡ Отлично", callback_data="energy_great"),
+            InlineKeyboardButton("⚡ Energy: low", callback_data="energy_low"),
+            InlineKeyboardButton("⚡ OK", callback_data="energy_ok"),
+            InlineKeyboardButton("⚡ Great", callback_data="energy_great"),
         ],
         [
-            InlineKeyboardButton("🦵 Не болит", callback_data="sore_none"),
-            InlineKeyboardButton("🦵 Немного", callback_data="sore_mild"),
-            InlineKeyboardButton("🦵 Сильно", callback_data="sore_heavy"),
+            InlineKeyboardButton("🦵 No soreness", callback_data="sore_none"),
+            InlineKeyboardButton("🦵 A little", callback_data="sore_mild"),
+            InlineKeyboardButton("🦵 Very sore", callback_data="sore_heavy"),
         ],
         [
-            InlineKeyboardButton("🏄 Серфила", callback_data="surf_yes"),
-            InlineKeyboardButton("🏄 Нет", callback_data="surf_no"),
+            InlineKeyboardButton("🌿 Outdoor: yes", callback_data="outdoor_yes"),
+            InlineKeyboardButton("🌿 No", callback_data="outdoor_no"),
         ],
         [
-            InlineKeyboardButton("⏱ 30 мин", callback_data="time_30"),
-            InlineKeyboardButton("⏱ 45 мин", callback_data="time_45"),
-            InlineKeyboardButton("⏱ 60 мин", callback_data="time_60"),
+            InlineKeyboardButton("⏱ 30 min", callback_data="time_30"),
+            InlineKeyboardButton("⏱ 45 min", callback_data="time_45"),
+            InlineKeyboardButton("⏱ 60 min", callback_data="time_60"),
         ],
         [
-            InlineKeyboardButton("PF: нет", callback_data="pf_none"),
-            InlineKeyboardButton("PF: лёгкие", callback_data="pf_mild"),
-            InlineKeyboardButton("PF: серьёзные", callback_data="pf_concerning"),
+            InlineKeyboardButton("PF: none", callback_data="pf_none"),
+            InlineKeyboardButton("PF: mild", callback_data="pf_mild"),
+            InlineKeyboardButton("PF: concerning", callback_data="pf_concerning"),
         ],
     ]
 
     context.user_data["checkin"] = {"oura": oura_data, "answers": {}}
     await update.message.reply_text(
-        f"{oura_data}\n\n👇 Ответь на вопросы (нажимай кнопки):",
+        f"{oura_data}\n\n👇 Answer the questions (tap the buttons):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -616,17 +719,17 @@ async def handle_checkin_callback(update: Update, context: ContextTypes.DEFAULT_
 
     # Parse the callback
     mapping = {
-        "energy_low": ("energy", "низкая"),
-        "energy_ok": ("energy", "нормальная"),
-        "energy_great": ("energy", "отличная"),
-        "sore_none": ("soreness", "нет"),
-        "sore_mild": ("soreness", "немного"),
-        "sore_heavy": ("soreness", "сильная"),
-        "surf_yes": ("surf", "да"),
-        "surf_no": ("surf", "нет"),
-        "time_30": ("time", "30 мин"),
-        "time_45": ("time", "45 мин"),
-        "time_60": ("time", "60 мин"),
+        "energy_low": ("energy", "low"),
+        "energy_ok": ("energy", "normal"),
+        "energy_great": ("energy", "great"),
+        "sore_none": ("soreness", "none"),
+        "sore_mild": ("soreness", "mild"),
+        "sore_heavy": ("soreness", "heavy"),
+        "outdoor_yes": ("outdoor", "yes"),
+        "outdoor_no": ("outdoor", "no"),
+        "time_30": ("time", "30 min"),
+        "time_45": ("time", "45 min"),
+        "time_60": ("time", "60 min"),
         "pf_none": ("pelvic_floor", "none"),
         "pf_mild": ("pelvic_floor", "mild"),
         "pf_concerning": ("pelvic_floor", "concerning"),
@@ -640,31 +743,43 @@ async def handle_checkin_callback(update: Update, context: ContextTypes.DEFAULT_
             set_pelvic_floor_status(val)
 
     # Check if we have all answers
-    needed = {"energy", "soreness", "surf", "time", "pelvic_floor"}
+    needed = {"energy", "soreness", "outdoor", "time", "pelvic_floor"}
     if needed.issubset(answers.keys()):
-        await query.edit_message_text("🧠 Генерирую тренировку...")
+        await query.edit_message_text("🧠 Generating workout...")
 
         prompt = f"{checkin['oura']}\n\n"
         apple_data = get_apple_health_today()
         if apple_data:
             prompt += f"{apple_data}\n\n"
         prompt += (
-            f"Субъективно:\n"
-            f"- Энергия: {answers['energy']}\n"
-            f"- Болезненность: {answers['soreness']}\n"
-            f"- Серфила вчера: {answers['surf']}\n"
-            f"- Время на тренировку: {answers['time']}\n"
-            f"- Тазовое дно: {answers['pelvic_floor']}\n\n"
-            f"Дай мне тренировку на сегодня."
+            f"Subjective check-in:\n"
+            f"- Energy: {answers['energy']}\n"
+            f"- Soreness: {answers['soreness']}\n"
+            f"- Outdoor activity yesterday: {answers['outdoor']}\n"
+            f"- Time for workout: {answers['time']}\n"
+            f"- Pelvic floor: {answers['pelvic_floor']}\n\n"
+            f"Give me today's workout."
         )
         reply = ask_claude(prompt)
         await query.edit_message_text(reply, parse_mode="Markdown")
+        # Send voice version of the workout
+        if VOICE_MODE in ("both", "voice") and edge_tts:
+            voice_path = await text_to_voice(reply)
+            if voice_path:
+                try:
+                    with open(voice_path, "rb") as vf:
+                        await query.message.reply_voice(vf)
+                finally:
+                    try:
+                        os.remove(voice_path)
+                    except OSError:
+                        pass
     else:
         answered = ", ".join(f"{k}: {v}" for k, v in answers.items())
         remaining = needed - answers.keys()
         await query.edit_message_text(
             f"{checkin['oura']}\n\n✅ {answered}\n\n"
-            f"👇 Ещё нужно: {', '.join(remaining)}",
+            f"👇 Still need: {', '.join(remaining)}",
             reply_markup=query.message.reply_markup
         )
 
@@ -673,9 +788,9 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    await update.message.reply_text("📅 Составляю план на неделю...")
+    await update.message.reply_text("📅 Building weekly plan...")
     reply = generate_weekly_plan()
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await send_voice_reply(update, update.effective_chat.id, reply)
 
 
 def generate_weekly_plan():
@@ -691,7 +806,7 @@ def generate_weekly_plan():
     week, cycle_start = get_current_training_week()
     deload_note = ""
     if week == 4:
-        deload_note = "\n⚠️ ЭТО НЕДЕЛЯ РАЗГРУЗКИ (week 4/4) — сниженный объём и интенсивность."
+        deload_note = "\n⚠️ THIS IS A DELOAD WEEK (week 4/4) — reduced volume and intensity."
 
     # Get progression data
     snapshots = get_latest_snapshots(1)
@@ -704,21 +819,21 @@ def generate_weekly_plan():
             if val:
                 lifts.append(f"{lift.replace('_', ' ').title()}: {val}")
         if lifts:
-            progression_note = f"\nТекущие показатели: {', '.join(lifts)}"
+            progression_note = f"\nCurrent lifts: {', '.join(lifts)}"
 
     prompt = (
-        f"Сегодня {datetime.now().strftime('%A, %B %d')}.\n"
-        f"Неделя цикла: {week}/4{deload_note}\n"
-        f"Тренды за неделю: {trends}\n"
+        f"Today is {datetime.now().strftime('%A, %B %d')}.\n"
+        f"Training cycle: week {week}/4{deload_note}\n"
+        f"Trends this week: {trends}\n"
         f"{progression_note}\n\n"
-        "Составь план тренировок на следующую неделю. "
-        "Для каждого дня укажи:\n"
-        "1. Тип тренировки (сила/пилатес/кардио/восстановление)\n"
-        "2. Интенсивность (лёгкая/средняя/тяжёлая)\n"
-        "3. Основные упражнения с подходами/повторениями\n"
-        "4. Запланируй сауну/бассейн для восстановления (2-3 раза)\n"
-        "5. Учти сёрфинг 2-3 раза в неделю\n"
-        "6. Один день полного отдыха или активного восстановления"
+        "Build a training plan for the coming week. "
+        "For each day include:\n"
+        "1. Workout type (strength/Pilates/cardio/recovery)\n"
+        "2. Intensity (light/moderate/heavy)\n"
+        "3. Key exercises with sets/reps\n"
+        "4. Schedule sauna/pool for recovery (2-3 times)\n"
+        "5. Include 2-3 outdoor activity days (running, swimming, hiking, cycling)\n"
+        "6. One full rest or active recovery day"
     )
     return ask_claude(prompt)
 
@@ -730,11 +845,12 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.replace("/log", "").strip()
     if not text:
         await update.message.reply_text(
-            "💪 Формат записи:\n\n"
+            "💪 Log format:\n\n"
             "`/log squat 60kg 3x8`\n"
             "`/log deadlift 80kg 4x5`\n"
+            "`/log hip_thrust 70kg 3x12`\n"
             "`/log plank 90sec`\n"
-            "`/log surf 60min heavy waves`\n"
+            "`/log running 30min`\n"
             "`/log pilates 45min`",
             parse_mode="Markdown"
         )
@@ -748,11 +864,11 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes_parts = []
 
     for p in parts[1:]:
-        if any(u in p.lower() for u in ["kg", "lb", "кг"]):
+        if any(u in p.lower() for u in ["kg", "lb"]):
             weight = p
         elif "x" in p.lower() and any(c.isdigit() for c in p):
             sets_reps = p
-        elif any(u in p.lower() for u in ["sec", "min", "сек", "мин"]):
+        elif any(u in p.lower() for u in ["sec", "min"]):
             sets_reps = p
         else:
             notes_parts.append(p)
@@ -766,7 +882,7 @@ async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        f"✅ Записано: {exercise}"
+        f"✅ Logged: {exercise}"
         + (f" {weight}" if weight else "")
         + (f" {sets_reps}" if sets_reps else "")
         + (f" ({notes})" if notes else "")
@@ -801,15 +917,15 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if snapshots:
         current = snapshots[0]
         previous = snapshots[1] if len(snapshots) > 1 else {}
-        text_parts.append("📊 *Ключевые показатели:*\n")
+        text_parts.append("📊 *Key Lifts:*\n")
         for lift in ["squat", "deadlift", "bench_press", "overhead_press", "hip_thrust", "row"]:
             c_val = current.get(lift)
             if c_val:
                 arrow = _trend_arrow(c_val, previous.get(lift))
                 text_parts.append(f"  *{lift.replace('_', ' ').title()}*: {c_val}{arrow}")
         if current.get("pilates"):
-            text_parts.append(f"\n🧘 *Пилатес:* {current['pilates']}")
-        text_parts.append(f"\n_Снимок от {current['date']}_\n")
+            text_parts.append(f"\n🧘 *Pilates:* {current['pilates']}")
+        text_parts.append(f"\n_Snapshot from {current['date']}_\n")
 
     # ── Recent workout log ──
     rows = db_execute(
@@ -818,7 +934,7 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not rows and not snapshots:
-        await update.message.reply_text("📈 Пока нет записей. Используй /log чтобы записать тренировку.")
+        await update.message.reply_text("📈 No entries yet. Use /log to record a workout.")
         return
 
     if rows:
@@ -837,7 +953,7 @@ async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 entry += f" ({notes})"
             exercises[ex].append(entry)
 
-        text_parts.append("\n📈 *Последние тренировки:*\n")
+        text_parts.append("\n📈 *Recent Workouts:*\n")
         for ex, entries in exercises.items():
             text_parts.append(f"*{ex.capitalize()}*")
             text_parts.append("\n".join(entries[:5]))
@@ -854,9 +970,9 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not text:
         await update.message.reply_text(
-            "⏰ Укажи время напоминания:\n\n"
-            "`/remind 7:00` — каждый день в 7 утра\n"
-            "`/remind off` — выключить",
+            "⏰ Set reminder time:\n\n"
+            "`/remind 7:00` — every day at 7 AM\n"
+            "`/remind off` — turn off",
             parse_mode="Markdown"
         )
         return
@@ -865,13 +981,13 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jobs = context.job_queue.get_jobs_by_name("morning_reminder")
         for job in jobs:
             job.schedule_removal()
-        await update.message.reply_text("⏰ Напоминание выключено.")
+        await update.message.reply_text("⏰ Reminder turned off.")
         return
 
     try:
         hour, minute = map(int, text.replace(":", " ").split())
     except ValueError:
-        await update.message.reply_text("Формат: `/remind 7:00`", parse_mode="Markdown")
+        await update.message.reply_text("Format: `/remind 7:00`", parse_mode="Markdown")
         return
 
     # Remove old reminders
@@ -890,16 +1006,16 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name="morning_reminder"
     )
 
-    await update.message.reply_text(f"✅ Напоминание установлено на {hour}:{minute:02d} каждый день.")
+    await update.message.reply_text(f"✅ Reminder set for {hour}:{minute:02d} every day.")
 
 
 async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Send morning reminder with Oura data."""
     oura_data = get_oura_summary()
     text = (
-        f"☀️ Доброе утро! Время для чек-ина.\n\n"
+        f"☀️ Good morning! Time for your check-in.\n\n"
         f"{oura_data}\n\n"
-        f"Нажми /checkin или просто напиши как себя чувствуешь."
+        f"Tap /checkin or just tell me how you're feeling."
     )
     await context.bot.send_message(chat_id=context.job.chat_id, text=text)
 
@@ -911,12 +1027,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not openai or not VOICE_API_KEY:
         await update.message.reply_text(
-            "🎙 Голосовые сообщения требуют API ключ для Whisper. "
-            "Добавь VOICE_API_KEY в .env (OpenAI, Groq или xAI) или напиши текстом."
+            "🎙 Voice messages require a Whisper API key. "
+            "Add VOICE_API_KEY to .env (OpenAI, Groq, or xAI) or type your message instead."
         )
         return
 
-    await update.message.reply_text("🎙 Расшифровываю голосовое...")
+    await update.message.reply_text("🎙 Transcribing voice message...")
 
     voice = update.message.voice or update.message.audio
     file = await context.bot.get_file(voice.file_id)
@@ -932,16 +1048,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     if not transcript:
-        await update.message.reply_text("❌ Не удалось расшифровать. Попробуй ещё раз или напиши текстом.")
+        await update.message.reply_text("❌ Could not transcribe. Try again or type your message instead.")
         return
 
-    await update.message.reply_text(f"📝 Расшифровка: _{transcript}_", parse_mode="Markdown")
+    await update.message.reply_text(f"📝 Transcript: _{transcript}_", parse_mode="Markdown")
 
     # Add Oura data and send to Claude
     oura_data = get_oura_summary()
-    prompt = f"{oura_data}\n\nМой голосовой чек-ин: {transcript}\n\nДай мне тренировку на сегодня."
+    prompt = f"{oura_data}\n\nMy voice check-in: {transcript}\n\nGive me today's workout."
     reply = ask_claude(prompt)
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await send_voice_reply(update, update.effective_chat.id, reply)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -951,7 +1067,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
     reply = ask_claude(text)
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await send_voice_reply(update, update.effective_chat.id, reply)
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -964,8 +1080,8 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not apple_data:
         await update.message.reply_text(
-            "⌚ Эта команда для автоматической отправки данных из Apple Shortcuts.\n"
-            "Настрой шорткат по гайду — он будет отправлять данные сюда автоматически."
+            "⌚ This command is for automatic data from Apple Shortcuts.\n"
+            "Set up the shortcut using the guide — it will send data here automatically."
         )
         return
 
@@ -977,8 +1093,8 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        f"✅ Apple Watch данные получены!\n\n{apple_data}\n\n"
-        "Данные будут учтены в следующем /checkin."
+        f"✅ Apple Watch data received!\n\n{apple_data}\n\n"
+        "Data will be included in your next /checkin."
     )
 
 
@@ -1002,19 +1118,19 @@ async def cmd_deload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.lower() == "reset":
         week = reset_training_week()
         await update.message.reply_text(
-            f"🔄 Цикл сброшен. Текущая неделя: {week}/4\n"
-            "Разгрузка будет на неделе 4."
+            f"🔄 Cycle reset. Current week: {week}/4\n"
+            "Deload will be on week 4."
         )
         return
 
     week, start = get_current_training_week()
-    deload_status = " ⚠️ РАЗГРУЗКА!" if week == 4 else ""
+    deload_status = " ⚠️ DELOAD!" if week == 4 else ""
     await update.message.reply_text(
-        f"📅 *Цикл нагрузки:*\n\n"
-        f"Текущая неделя: *{week}/4*{deload_status}\n"
-        f"Начало цикла: {start}\n\n"
-        f"Разгрузка на неделе 4 — сниженный объём и интенсивность.\n"
-        f"Сброс: `/deload reset`",
+        f"📅 *Training Cycle:*\n\n"
+        f"Current week: *{week}/4*{deload_status}\n"
+        f"Cycle start: {start}\n\n"
+        f"Deload on week 4 — reduced volume and intensity.\n"
+        f"Reset: `/deload reset`",
         parse_mode="Markdown"
     )
 
@@ -1031,12 +1147,12 @@ async def cmd_updateprogress(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not text:
         await update.message.reply_text(
-            "📊 *Запись показателей*\n\n"
-            "Формат:\n"
+            "📊 *Record Your Lifts*\n\n"
+            "Format:\n"
             "`/updateprogress squat:65kg3x8 deadlift:85kg4x5 bench:50kg3x8 ohp:30kg3x8 hipthrust:80kg3x10 row:40kg3x10`\n\n"
-            "Для пилатес:\n"
+            "For Pilates:\n"
             "`/updateprogress pilates:full_teaser,single_leg_stretch`\n\n"
-            "Можно указать не все — только те что обновились.",
+            "You can update just the ones that changed.",
             parse_mode="Markdown"
         )
         return
@@ -1049,28 +1165,28 @@ async def cmd_updateprogress(update: Update, context: ContextTypes.DEFAULT_TYPE)
             data[key.lower().strip()] = val.strip()
 
     if not data:
-        await update.message.reply_text("❌ Не удалось распарсить. Формат: `squat:65kg3x8`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Could not parse. Format: `squat:65kg3x8`", parse_mode="Markdown")
         return
 
     save_progression_snapshot(data)
 
     saved = ", ".join(f"{k}: {v}" for k, v in data.items())
-    await update.message.reply_text(f"✅ Показатели записаны!\n{saved}")
+    await update.message.reply_text(f"✅ Lifts recorded!\n{saved}")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🏋️ *Команды:*\n\n"
-        "📋 /checkin — утренний чек-ин\n"
-        "📅 /week — план на неделю\n"
-        "💪 /log — записать упражнение\n"
-        "📈 /progress — прогресс с трендами\n"
-        "⏰ /remind — напоминание\n"
-        "⌚ /health — данные Apple Watch (из Shortcuts)\n"
-        "🔄 /deload — проверить/сбросить цикл нагрузки\n"
-        "📊 /updateprogress — записать текущие показатели\n"
-        "❓ /help — эта справка\n\n"
-        "Или просто пиши/говори что угодно — я отвечу как тренер."
+        "🏋️ *Commands:*\n\n"
+        "📋 /checkin — morning check-in\n"
+        "📅 /week — weekly training plan\n"
+        "💪 /log — log a workout\n"
+        "📈 /progress — progress with trends\n"
+        "⏰ /remind — set reminder\n"
+        "⌚ /health — Apple Watch data (from Shortcuts)\n"
+        "🔄 /deload — check/reset training cycle\n"
+        "📊 /updateprogress — record current lifts\n"
+        "❓ /help — this help\n\n"
+        "Or just text/voice anything — I'll respond as your coach."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -1084,19 +1200,19 @@ async def sunday_weekly_plan(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Training week advanced to {new_week}/4")
 
     plan = generate_weekly_plan()
-    text = f"📅 *Автоматический план на неделю* (неделя {new_week}/4)\n\n{plan}"
-    await context.bot.send_message(chat_id=context.job.chat_id, text=text, parse_mode="Markdown")
+    text = f"📅 *Auto Weekly Plan* (week {new_week}/4)\n\n{plan}"
+    await send_voice_reply(context, context.job.chat_id, text)
 
 
 async def biweekly_progression_checkin(context: ContextTypes.DEFAULT_TYPE):
     """Every 14 days, ask user to update progression numbers."""
     text = (
-        "📊 *Время обновить показатели!*\n\n"
-        "Прошло 2 недели — запиши свои текущие рабочие веса:\n\n"
+        "📊 *Time to update your lifts!*\n\n"
+        "It's been 2 weeks — record your current working weights:\n\n"
         "`/updateprogress squat:XXkg deadlift:XXkg bench:XXkg ohp:XXkg hipthrust:XXkg row:XXkg`\n\n"
-        "Пилатес milestones:\n"
-        "`/updateprogress pilates:описание_достижений`\n\n"
-        "Это поможет отслеживать прогресс и корректировать программу."
+        "Pilates milestones:\n"
+        "`/updateprogress pilates:your_milestones_here`\n\n"
+        "This helps track progress and adjust your program."
     )
     await context.bot.send_message(chat_id=context.job.chat_id, text=text, parse_mode="Markdown")
 

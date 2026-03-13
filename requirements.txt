@@ -3,3 +3,4 @@ anthropic
 requests
 python-dotenv
 openai
+edge-tts
